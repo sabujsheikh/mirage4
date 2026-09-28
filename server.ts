@@ -1098,7 +1098,7 @@ async function startServer() {
   app.post('/api/orders/:id/pack', (req, res) => {
     try {
       const actor = getAuthenticatedActor(req);
-      const { package_weight_grams, box_size, qa_notes } = req.body;
+      const { package_weight_grams, box_size, qa_notes, scanned_packaging_barcodes } = req.body;
       const order = db.packOrder({
         order_id: req.params.id,
         actor_id: actor.id,
@@ -1106,6 +1106,7 @@ async function startServer() {
         package_weight_grams: package_weight_grams ? Number(package_weight_grams) : undefined,
         box_size,
         qa_notes,
+        scanned_packaging_barcodes: Array.isArray(scanned_packaging_barcodes) ? scanned_packaging_barcodes : undefined,
       });
       broadcastEvent('order_packed', order);
       res.json(order);
@@ -3987,25 +3988,99 @@ async function startServer() {
 
   app.post('/api/packaging/materials', (req, res) => {
     try {
-      const { name, barcode, sku, category, unit, reorder_level, unit_cost, notes, opening_stock, actor_id, actor_name } = req.body;
-      if (!name || !barcode || !category) return res.status(400).json({ error: 'Name, barcode, and category are required' });
-      // Check duplicate barcode
-      const existing = Array.from(db.packagingMaterials.values()).find(m => m.barcode === barcode);
-      if (existing) return res.status(409).json({ error: `Barcode ${barcode} already registered as ${existing.name}` });
-      const mat = db.createPackagingMaterial({ name, barcode, sku: sku || barcode, category: category || 'other', unit: unit || 'piece', reorder_level: reorder_level || 10, unit_cost: unit_cost || 0, notes, opening_stock: opening_stock || 0, actor_id, actor_name });
+      const {
+        name,
+        barcode,
+        sku,
+        category,
+        unit,
+        reorder_level,
+        unit_cost,
+        notes,
+        opening_stock,
+        track_scan,
+        grams_per_piece,
+        conversion,
+        actor_id,
+        actor_name,
+      } = req.body;
+      if (!name || !category) {
+        return res.status(400).json({ error: 'Name and category are required' });
+      }
+      const mat = db.createPackagingMaterial({
+        name,
+        barcode,
+        sku,
+        category,
+        unit: unit || 'piece',
+        reorder_level: reorder_level || 10,
+        unit_cost: unit_cost || 0,
+        notes,
+        opening_stock: opening_stock || 0,
+        track_scan,
+        grams_per_piece,
+        conversion,
+        actor_id,
+        actor_name,
+      });
       res.json(mat);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      res.status(400).json({ error: err.message });
     }
   });
 
   app.put('/api/packaging/materials/:id', (req, res) => {
     try {
       const { id } = req.params;
-      const { name, barcode, sku, category, unit, reorder_level, unit_cost, notes, actor_id, actor_name } = req.body;
-      const mat = db.updatePackagingMaterial(id, { name, barcode, sku, category, unit, reorder_level, unit_cost, notes }, actor_id, actor_name);
+      const {
+        name,
+        barcode,
+        sku,
+        category,
+        unit,
+        reorder_level,
+        unit_cost,
+        notes,
+        active,
+        track_scan,
+        grams_per_piece,
+        conversion,
+        actor_id,
+        actor_name,
+      } = req.body;
+      const mat = db.updatePackagingMaterial(
+        id,
+        {
+          name,
+          barcode,
+          sku,
+          category,
+          unit,
+          reorder_level,
+          unit_cost,
+          notes,
+          active,
+          track_scan,
+          grams_per_piece,
+          conversion,
+        },
+        actor_id,
+        actor_name
+      );
       if (!mat) return res.status(404).json({ error: 'Material not found' });
       res.json(mat);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/packaging/materials/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { actor_id, actor_name } = req.body || {};
+      const success = db.deletePackagingMaterial(id, actor_id, actor_name);
+      if (!success) return res.status(404).json({ error: 'Material not found' });
+      res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -4013,23 +4088,167 @@ async function startServer() {
 
   app.post('/api/packaging/receive', (req, res) => {
     try {
-      const { material_id, quantity, unit_cost, reference_note, actor_id, actor_name } = req.body;
-      if (!material_id || !quantity) return res.status(400).json({ error: 'material_id and quantity required' });
-      const mat = db.receivePackagingStock(material_id, quantity, unit_cost || 0, reference_note, actor_id, actor_name);
+      const {
+        material_id,
+        quantity,
+        unit_cost,
+        payment_account_id,
+        purchase_date,
+        supplier_name,
+        reference_note,
+        actor_id,
+        actor_name,
+      } = req.body;
+      if (!material_id || !quantity) {
+        return res.status(400).json({ error: 'material_id and quantity required' });
+      }
+      const mat = db.receivePackagingStock({
+        material_id,
+        quantity: Number(quantity),
+        unit_cost: Number(unit_cost) || 0,
+        payment_account_id,
+        purchase_date,
+        supplier_name,
+        reference_note,
+        actor_id,
+        actor_name,
+      });
       if (!mat) return res.status(404).json({ error: 'Material not found' });
       res.json(mat);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/packaging/movements', (req, res) => {
+    const { material_id, reason, date_from, date_to } = req.query;
+    let movements = [...db.packagingStockMovements];
+    if (material_id) movements = movements.filter(m => m.material_id === material_id);
+    if (reason) movements = movements.filter(m => m.reason === reason);
+    if (date_from) movements = movements.filter(m => m.created_at.slice(0, 10) >= String(date_from));
+    if (date_to) movements = movements.filter(m => m.created_at.slice(0, 10) <= String(date_to));
+    movements.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    res.json(movements);
+  });
+
+  // Packaging Rules
+  app.get('/api/packaging/rules', (req, res) => {
+    res.json(db.getPackagingRules());
+  });
+
+  app.post('/api/packaging/rules', (req, res) => {
+    try {
+      const { name, min_pieces, max_pieces, material_id, quantity, active, actor_id, actor_name } = req.body;
+      if (!name || min_pieces === undefined || !material_id || !quantity) {
+        return res.status(400).json({ error: 'name, min_pieces, material_id, and quantity are required' });
+      }
+      const rule = db.createPackagingRule({
+        name,
+        min_pieces: Number(min_pieces),
+        max_pieces: max_pieces !== undefined && max_pieces !== null ? Number(max_pieces) : null,
+        material_id,
+        quantity: Number(quantity),
+        active,
+        actor_id,
+        actor_name,
+      });
+      res.json(rule);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/packaging/rules/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name, min_pieces, max_pieces, material_id, quantity, active, actor_id, actor_name } = req.body;
+      const rule = db.updatePackagingRule(
+        id,
+        {
+          name,
+          min_pieces: min_pieces !== undefined ? Number(min_pieces) : undefined,
+          max_pieces: max_pieces !== undefined ? (max_pieces !== null ? Number(max_pieces) : null) : undefined,
+          material_id,
+          quantity: quantity !== undefined ? Number(quantity) : undefined,
+          active,
+        },
+        actor_id,
+        actor_name
+      );
+      if (!rule) return res.status(404).json({ error: 'Rule not found' });
+      res.json(rule);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/packaging/rules/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { actor_id, actor_name } = req.body || {};
+      const success = db.deletePackagingRule(id, actor_id, actor_name);
+      if (!success) return res.status(404).json({ error: 'Rule not found' });
+      res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.get('/api/packaging/movements', (req, res) => {
-    const { material_id, reason } = req.query;
-    let movements = [...db.packagingStockMovements];
-    if (material_id) movements = movements.filter(m => m.material_id === material_id);
-    if (reason) movements = movements.filter(m => m.reason === reason);
-    movements.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    res.json(movements);
+  // Packaging Counts
+  app.get('/api/packaging/counts', (req, res) => {
+    res.json(db.getPackagingCounts());
+  });
+
+  app.post('/api/packaging/counts', (req, res) => {
+    try {
+      const { counted_at, notes, items, actor_id, actor_name } = req.body;
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: 'items array is required' });
+      }
+      const countRecord = db.recordPackagingCount({
+        counted_at,
+        notes,
+        items,
+        actor_id,
+        actor_name,
+      });
+      res.json(countRecord);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Packaging Settings
+  app.get('/api/packaging/settings', (req, res) => {
+    res.json(db.getPackagingSettings());
+  });
+
+  app.put('/api/packaging/settings', (req, res) => {
+    try {
+      const { cover_days, actor_id, actor_name } = req.body;
+      const settings = db.updatePackagingSettings({ cover_days: Number(cover_days) }, actor_id, actor_name);
+      res.json(settings);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Packaging Reports & Buy-List
+  app.get('/api/packaging/reports/usage', (req, res) => {
+    const { start_date, end_date } = req.query;
+    const report = db.getPackagingUsageReport({
+      start_date: start_date as string,
+      end_date: end_date as string,
+    });
+    res.json(report);
+  });
+
+  app.get('/api/packaging/buy-list', (req, res) => {
+    const { cover_days } = req.query;
+    const buyList = db.getPackagingBuyList({
+      cover_days: cover_days ? Number(cover_days) : undefined,
+    });
+    res.json(buyList);
   });
 
   // 11. Notifications

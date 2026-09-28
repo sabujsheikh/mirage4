@@ -68,6 +68,13 @@ import {
   PackagingStockMovement,
   PackagingCategory,
   PackagingStockMovementReason,
+  PackagingRule,
+  PackagingSettings,
+  PackagingCount,
+  PackagingCountItem,
+  PackagingConversion,
+  PackagingUsageReportItem,
+  PackagingBuyListItem,
   ProductBatch,
   OrderItemAllocation,
   DamagedStockRecord,
@@ -228,6 +235,9 @@ export class MirageDB {
   public pricingCampaigns: Map<string, PricingCampaign> = new Map();
   public packagingMaterials: Map<string, PackagingMaterial> = new Map();
   public packagingStockMovements: PackagingStockMovement[] = [];
+  public packagingRules: Map<string, PackagingRule> = new Map();
+  public packagingCounts: Map<string, PackagingCount> = new Map();
+  public packagingSettings: PackagingSettings = { cover_days: 30 };
   public backups: BackupSnapshot[] = [];
   public backupPayloads: Map<string, any> = new Map();
   public securitySettings: SecuritySettings = {
@@ -1544,6 +1554,7 @@ export class MirageDB {
     package_weight_grams?: number;
     box_size?: string;
     qa_notes?: string;
+    scanned_packaging_barcodes?: string[];
   }): Order {
     const order = this.orders.get(params.order_id);
     if (!order) throw new Error('Order not found');
@@ -1654,6 +1665,86 @@ export class MirageDB {
           this.stockMovements.unshift(mov);
         }
       }
+    }
+
+    // Deduct Packaging Materials (never blocks packing on failure — try/catch)
+    try {
+      const totalPieces = order.items.reduce((sum, item) => sum + (item.quantity || 0), 0);
+      const now = new Date().toISOString();
+
+      // 1. Rule deductions
+      const activeRules = Array.from(this.packagingRules.values()).filter(r => r.active);
+      for (const rule of activeRules) {
+        const minOk = totalPieces >= rule.min_pieces;
+        const maxOk = rule.max_pieces === null || rule.max_pieces === undefined || totalPieces <= rule.max_pieces;
+        if (minOk && maxOk && rule.quantity > 0) {
+          const mat = this.packagingMaterials.get(rule.material_id);
+          if (mat) {
+            const toDeduct = Math.min(rule.quantity, Math.max(0, mat.on_hand));
+            if (toDeduct > 0) {
+              mat.on_hand -= toDeduct;
+              mat.available = mat.on_hand - mat.reserved;
+              mat.updated_at = now;
+              this.packagingStockMovements.push({
+                id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                material_id: mat.id,
+                material_name: mat.name,
+                barcode: mat.barcode || '',
+                quantity_delta: -toDeduct,
+                reason: 'PACKAGING_USED_RULE',
+                unit_cost: mat.unit_cost,
+                reference_id: order.id,
+                reference_note: `Rule "${rule.name}" for order ${order.invoice_number}`,
+                created_by: params.actor_id || 'system',
+                created_by_name: params.actor_name || 'System',
+                created_at: now,
+              });
+            }
+          }
+        }
+      }
+
+      // 2. Scan deductions
+      if (Array.isArray(params.scanned_packaging_barcodes) && params.scanned_packaging_barcodes.length > 0) {
+        for (const scannedBarcode of params.scanned_packaging_barcodes) {
+          if (!scannedBarcode || !scannedBarcode.trim()) continue;
+          const clean = scannedBarcode.trim().toLowerCase();
+          const mat = Array.from(this.packagingMaterials.values()).find(
+            m => m.track_scan && m.barcode && m.barcode.trim().toLowerCase() === clean
+          );
+          if (mat) {
+            const toDeduct = Math.min(1, Math.max(0, mat.on_hand));
+            if (toDeduct > 0) {
+              mat.on_hand -= toDeduct;
+              mat.available = mat.on_hand - mat.reserved;
+              mat.updated_at = now;
+              this.packagingStockMovements.push({
+                id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                material_id: mat.id,
+                material_name: mat.name,
+                barcode: mat.barcode || '',
+                quantity_delta: -toDeduct,
+                reason: 'PACKAGING_USED_SCAN',
+                unit_cost: mat.unit_cost,
+                reference_id: order.id,
+                reference_note: `Scanned at packing for order ${order.invoice_number}`,
+                created_by: params.actor_id || 'system',
+                created_by_name: params.actor_name || 'System',
+                created_at: now,
+              });
+            }
+          }
+        }
+      }
+    } catch (pkgErr: any) {
+      this.logAudit(
+        params.actor_id || 'system',
+        params.actor_name || 'System',
+        'packaging_deduction_failed',
+        'order',
+        order.id,
+        `Packaging stock deduction failed for order ${order.invoice_number}: ${pkgErr?.message || pkgErr}`
+      );
     }
 
     // Update order status
@@ -8272,6 +8363,9 @@ export class MirageDB {
         pricing_campaigns: Array.from(this.pricingCampaigns.values()),
         packaging_materials: Array.from(this.packagingMaterials.values()),
         packaging_stock_movements: this.packagingStockMovements,
+        packaging_rules: Array.from(this.packagingRules.values()),
+        packaging_counts: Array.from(this.packagingCounts.values()),
+        packaging_settings: this.packagingSettings,
         accounts: Array.from(this.accounts.values()),
         payment_accounts: Array.from(this.paymentAccounts.values()),
         fund_transfers: Array.from(this.fundTransfers.values()),
@@ -8430,6 +8524,17 @@ export class MirageDB {
     }
     if (Array.isArray(d.packaging_stock_movements)) {
       this.packagingStockMovements = [...d.packaging_stock_movements];
+    }
+    if (Array.isArray(d.packaging_rules)) {
+      this.packagingRules.clear();
+      d.packaging_rules.forEach((r: PackagingRule) => this.packagingRules.set(r.id, r));
+    }
+    if (Array.isArray(d.packaging_counts)) {
+      this.packagingCounts.clear();
+      d.packaging_counts.forEach((c: PackagingCount) => this.packagingCounts.set(c.id, c));
+    }
+    if (d.packaging_settings) {
+      this.packagingSettings = { ...d.packaging_settings };
     }
 
     const counts = {
@@ -9327,22 +9432,22 @@ export class MirageDB {
 
   private seedPackagingMaterials(): void {
     const materials: PackagingMaterial[] = [
-      { id: 'pkg_ctn_s', name: 'Small Carton', barcode: 'CTN-S', sku: 'CTN-S', category: 'carton', unit: 'piece', on_hand: 85, reserved: 0, available: 85, reorder_level: 20, unit_cost: 35, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_ctn_m', name: 'Medium Carton', barcode: 'CTN-M', sku: 'CTN-M', category: 'carton', unit: 'piece', on_hand: 112, reserved: 0, available: 112, reorder_level: 20, unit_cost: 55, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_ctn_l', name: 'Large Carton', barcode: 'CTN-L', sku: 'CTN-L', category: 'carton', unit: 'piece', on_hand: 45, reserved: 0, available: 45, reorder_level: 15, unit_cost: 75, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_poly_s', name: 'Small Poly Bag', barcode: 'POLY-S', sku: 'POLY-S', category: 'poly', unit: 'piece', on_hand: 200, reserved: 0, available: 200, reorder_level: 50, unit_cost: 8, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_poly_m', name: 'Medium Poly Bag', barcode: 'POLY-M', sku: 'POLY-M', category: 'poly', unit: 'piece', on_hand: 180, reserved: 0, available: 180, reorder_level: 50, unit_cost: 12, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_poly_l', name: 'Large Poly Bag', barcode: 'POLY-L', sku: 'POLY-L', category: 'poly', unit: 'piece', on_hand: 95, reserved: 0, available: 95, reorder_level: 30, unit_cost: 18, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_poly_ml', name: 'Poly Bag M-L', barcode: 'POLY-ML', sku: 'POLY-ML', category: 'poly', unit: 'piece', on_hand: 140, reserved: 0, available: 140, reorder_level: 40, unit_cost: 15, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_bubble', name: 'Bubble Wrap Roll', barcode: 'BUBBLE-01', sku: 'BUBBLE-01', category: 'wrapping', unit: 'roll', on_hand: 8, reserved: 0, available: 8, reorder_level: 3, unit_cost: 350, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_gumtape', name: '48mm Gum Tape', barcode: 'TAPE-48', sku: 'TAPE-48', category: 'tape', unit: 'roll', on_hand: 12, reserved: 0, available: 12, reorder_level: 5, unit_cost: 85, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_scotch', name: 'Scotch Tape', barcode: 'TAPE-SC', sku: 'TAPE-SC', category: 'tape', unit: 'roll', on_hand: 6, reserved: 0, available: 6, reorder_level: 3, unit_cost: 45, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_scissors', name: 'Scissors', barcode: 'TOOL-SC', sku: 'TOOL-SC', category: 'cutting_tool', unit: 'piece', on_hand: 3, reserved: 0, available: 3, reorder_level: 1, unit_cost: 120, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_cutter', name: 'Anti Cutter', barcode: 'TOOL-AC', sku: 'TOOL-AC', category: 'cutting_tool', unit: 'piece', on_hand: 2, reserved: 0, available: 2, reorder_level: 1, unit_cost: 150, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_blades', name: 'Cutter Blades', barcode: 'TOOL-BL', sku: 'TOOL-BL', category: 'cutting_tool', unit: 'pack', on_hand: 15, reserved: 0, available: 15, reorder_level: 5, unit_cost: 25, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_giftpaper', name: 'Gift Paper Roll', barcode: 'GIFT-PAP', sku: 'GIFT-PAP', category: 'gift', unit: 'roll', on_hand: 10, reserved: 0, available: 10, reorder_level: 3, unit_cost: 200, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_sticker', name: 'Parcel Sticker', barcode: 'LBL-PAR', sku: 'LBL-PAR', category: 'label', unit: 'sheet', on_hand: 300, reserved: 0, available: 300, reorder_level: 100, unit_cost: 3, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: 'pkg_ty_card', name: 'Thank You Card', barcode: 'GIFT-TYC', sku: 'GIFT-TYC', category: 'gift', unit: 'piece', on_hand: 250, reserved: 0, available: 250, reorder_level: 80, unit_cost: 5, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_ctn_s', name: 'Small Carton', barcode: 'CTN-S', sku: 'CTN-S', category: 'carton', unit: 'piece', on_hand: 85, reserved: 0, available: 85, reorder_level: 20, unit_cost: 35, track_scan: true, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_ctn_m', name: 'Medium Carton', barcode: 'CTN-M', sku: 'CTN-M', category: 'carton', unit: 'piece', on_hand: 112, reserved: 0, available: 112, reorder_level: 20, unit_cost: 55, track_scan: true, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_ctn_l', name: 'Large Carton', barcode: 'CTN-L', sku: 'CTN-L', category: 'carton', unit: 'piece', on_hand: 45, reserved: 0, available: 45, reorder_level: 15, unit_cost: 75, track_scan: true, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_poly_s', name: 'Small Poly Bag', barcode: 'POLY-S', sku: 'POLY-S', category: 'poly', unit: 'piece', on_hand: 200, reserved: 0, available: 200, reorder_level: 50, unit_cost: 8, track_scan: false, grams_per_piece: 4.5, conversion: { method: 'dimensions', width_cm: 15, length_cm: 20, thickness_micron: 50, polymer: 'LDPE' }, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_poly_m', name: 'Medium Poly Bag', barcode: 'POLY-M', sku: 'POLY-M', category: 'poly', unit: 'piece', on_hand: 180, reserved: 0, available: 180, reorder_level: 50, unit_cost: 12, track_scan: false, grams_per_piece: 7.2, conversion: { method: 'dimensions', width_cm: 20, length_cm: 30, thickness_micron: 50, polymer: 'LDPE' }, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_poly_l', name: 'Large Poly Bag', barcode: 'POLY-L', sku: 'POLY-L', category: 'poly', unit: 'piece', on_hand: 95, reserved: 0, available: 95, reorder_level: 30, unit_cost: 18, track_scan: false, grams_per_piece: 12.0, conversion: { method: 'dimensions', width_cm: 25, length_cm: 35, thickness_micron: 60, polymer: 'LDPE' }, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_poly_ml', name: 'Poly Bag M-L', barcode: 'POLY-ML', sku: 'POLY-ML', category: 'poly', unit: 'piece', on_hand: 140, reserved: 0, available: 140, reorder_level: 40, unit_cost: 15, track_scan: false, grams_per_piece: 9.5, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_bubble', name: 'Bubble Wrap Roll', barcode: 'BUBBLE-01', sku: 'BUBBLE-01', category: 'wrapping', unit: 'roll', on_hand: 8, reserved: 0, available: 8, reorder_level: 3, unit_cost: 350, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_gumtape', name: '48mm Gum Tape', barcode: 'TAPE-48', sku: 'TAPE-48', category: 'tape', unit: 'roll', on_hand: 12, reserved: 0, available: 12, reorder_level: 5, unit_cost: 85, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_scotch', name: 'Scotch Tape', barcode: 'TAPE-SC', sku: 'TAPE-SC', category: 'tape', unit: 'roll', on_hand: 6, reserved: 0, available: 6, reorder_level: 3, unit_cost: 45, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_scissors', name: 'Scissors', barcode: 'TOOL-SC', sku: 'TOOL-SC', category: 'cutting_tool', unit: 'piece', on_hand: 3, reserved: 0, available: 3, reorder_level: 1, unit_cost: 120, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_cutter', name: 'Anti Cutter', barcode: 'TOOL-AC', sku: 'TOOL-AC', category: 'cutting_tool', unit: 'piece', on_hand: 2, reserved: 0, available: 2, reorder_level: 1, unit_cost: 150, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_blades', name: 'Cutter Blades', barcode: 'TOOL-BL', sku: 'TOOL-BL', category: 'cutting_tool', unit: 'pack', on_hand: 15, reserved: 0, available: 15, reorder_level: 5, unit_cost: 25, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_giftpaper', name: 'Gift Paper Roll', barcode: 'GIFT-PAP', sku: 'GIFT-PAP', category: 'gift', unit: 'roll', on_hand: 10, reserved: 0, available: 10, reorder_level: 3, unit_cost: 200, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_sticker', name: 'Parcel Sticker', barcode: 'LBL-PAR', sku: 'LBL-PAR', category: 'label', unit: 'sheet', on_hand: 300, reserved: 0, available: 300, reorder_level: 100, unit_cost: 3, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: 'pkg_ty_card', name: 'Thank You Card', barcode: 'GIFT-TYC', sku: 'GIFT-TYC', category: 'gift', unit: 'piece', on_hand: 250, reserved: 0, available: 250, reorder_level: 80, unit_cost: 5, track_scan: false, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
     ];
     materials.forEach(m => this.packagingMaterials.set(m.id, m));
     // Seed opening balance movements for each material
@@ -9351,7 +9456,7 @@ export class MirageDB {
         id: `pkgmov_ob_${m.id}`,
         material_id: m.id,
         material_name: m.name,
-        barcode: m.barcode,
+        barcode: m.barcode || '',
         quantity_delta: m.on_hand,
         reason: 'OPENING_BALANCE',
         unit_cost: m.unit_cost,
@@ -9361,82 +9466,321 @@ export class MirageDB {
         notes: 'Initial opening balance',
       });
     });
+
+    // Seed default packaging rules
+    const defaultRules: PackagingRule[] = [
+      { id: 'rule_single_carton', name: 'Standard Carton (1-2 bottles)', min_pieces: 1, max_pieces: 2, material_id: 'pkg_ctn_m', quantity: 1, active: true, created_at: new Date().toISOString() },
+      { id: 'rule_large_carton', name: 'Large Carton (3+ bottles)', min_pieces: 3, max_pieces: null, material_id: 'pkg_ctn_l', quantity: 1, active: true, created_at: new Date().toISOString() },
+      { id: 'rule_parcel_sticker', name: 'Shipping Parcel Sticker', min_pieces: 1, max_pieces: null, material_id: 'pkg_sticker', quantity: 1, active: true, created_at: new Date().toISOString() },
+      { id: 'rule_thank_you_card', name: 'Thank You Card', min_pieces: 1, max_pieces: null, material_id: 'pkg_ty_card', quantity: 1, active: true, created_at: new Date().toISOString() },
+    ];
+    defaultRules.forEach(r => this.packagingRules.set(r.id, r));
+  }
+
+  // --- Packaging Engine & Validation ---
+
+  public validatePackagingBarcode(barcode?: string, track_scan?: boolean, currentMaterialId?: string): void {
+    const trimmed = barcode ? barcode.trim() : '';
+    if (track_scan && !trimmed) {
+      throw new Error('Barcode is required when scan tracking is enabled');
+    }
+    if (!trimmed) return;
+    const clean = trimmed.toLowerCase();
+
+    // Check unique among non-empty packaging barcodes
+    for (const [id, m] of this.packagingMaterials.entries()) {
+      if (id !== currentMaterialId && m.barcode && m.barcode.trim().toLowerCase() === clean) {
+        throw new Error(`Barcode "${barcode}" is already registered as ${m.name}`);
+      }
+    }
+    // Check products
+    for (const p of this.products.values()) {
+      if (p.barcode && p.barcode.trim().toLowerCase() === clean) {
+        throw new Error(`Barcode "${barcode}" conflicts with product barcode for "${p.display_name}"`);
+      }
+    }
+    // Check orders
+    for (const o of this.orders.values()) {
+      if (o.invoice_number && o.invoice_number.trim().toLowerCase() === clean) {
+        throw new Error(`Barcode "${barcode}" conflicts with order invoice number "${o.invoice_number}"`);
+      }
+    }
+  }
+
+  public calculatePackagingConversion(conv: PackagingConversion): number {
+    if (conv.method === 'sample') {
+      if (conv.sample_pieces && conv.sample_pieces > 0 && conv.sample_grams && conv.sample_grams > 0) {
+        return Number((conv.sample_grams / conv.sample_pieces).toFixed(3));
+      }
+      return 0;
+    }
+    if (conv.method === 'dimensions') {
+      const w = conv.width_cm || 0;
+      const l = conv.length_cm || 0;
+      const thickMicron = conv.thickness_micron || 0;
+      const densityMap: Record<string, number> = {
+        LDPE: 0.92,
+        HDPE: 0.95,
+        PP: 0.90,
+      };
+      const density = conv.polymer ? (densityMap[conv.polymer] || 0.92) : 0.92;
+      // 2 sides (front + back) * width_cm * length_cm * (thickness_micron / 10000) * density
+      const areaCm2 = 2 * w * l;
+      const thickCm = thickMicron / 10000;
+      const grams = areaCm2 * thickCm * density;
+      return Number(grams.toFixed(3));
+    }
+    return 0;
   }
 
   // Packaging Materials CRUD
   public createPackagingMaterial(params: {
-    name: string; barcode: string; sku: string; category: PackagingCategory;
-    unit: string; reorder_level: number; unit_cost: number; notes?: string;
-    opening_stock?: number; actor_id?: string; actor_name?: string;
+    name: string;
+    barcode?: string;
+    sku?: string;
+    category: PackagingCategory;
+    unit: string;
+    reorder_level: number;
+    unit_cost: number;
+    notes?: string;
+    opening_stock?: number;
+    track_scan?: boolean;
+    grams_per_piece?: number;
+    conversion?: PackagingConversion;
+    actor_id?: string;
+    actor_name?: string;
   }): PackagingMaterial {
-    const id = `pkg_${Date.now()}`;
+    const id = `pkg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const now = new Date().toISOString();
-    const openingStock = params.opening_stock || 0;
+    const trackScan = params.track_scan !== undefined ? Boolean(params.track_scan) : params.category === 'carton';
+    const barcode = params.barcode ? params.barcode.trim() : '';
+    this.validatePackagingBarcode(barcode, trackScan);
+
+    let gramsPerPiece = params.grams_per_piece;
+    if (params.conversion) {
+      const calculated = this.calculatePackagingConversion(params.conversion);
+      if (calculated > 0) gramsPerPiece = calculated;
+    }
+
+    const openingStock = Math.max(0, Number(params.opening_stock) || 0);
     const mat: PackagingMaterial = {
-      id, name: params.name, barcode: params.barcode, sku: params.sku,
-      category: params.category, unit: params.unit,
-      on_hand: openingStock, reserved: 0, available: openingStock,
-      reorder_level: params.reorder_level, unit_cost: params.unit_cost,
-      notes: params.notes, active: true, created_at: now, updated_at: now,
+      id,
+      name: params.name.trim(),
+      barcode: barcode || undefined,
+      sku: (params.sku || barcode || params.name.slice(0, 6).toUpperCase()).trim(),
+      category: params.category,
+      unit: params.unit || 'piece',
+      on_hand: openingStock,
+      reserved: 0,
+      available: openingStock,
+      reorder_level: Number(params.reorder_level) || 0,
+      unit_cost: Number(params.unit_cost) || 0,
+      notes: params.notes,
+      active: true,
+      track_scan: trackScan,
+      grams_per_piece: gramsPerPiece,
+      conversion: params.conversion,
+      created_at: now,
+      updated_at: now,
     };
     this.packagingMaterials.set(id, mat);
     if (openingStock > 0) {
       this.packagingStockMovements.push({
-        id: `pkgmov_${Date.now()}`, material_id: id, material_name: mat.name,
-        barcode: mat.barcode, quantity_delta: openingStock, reason: 'OPENING_BALANCE',
-        unit_cost: mat.unit_cost, created_by: params.actor_id || 'system',
-        created_by_name: params.actor_name || 'System', created_at: now,
+        id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        material_id: id,
+        material_name: mat.name,
+        barcode: mat.barcode || '',
+        quantity_delta: openingStock,
+        reason: 'OPENING_BALANCE',
+        unit_cost: mat.unit_cost,
+        created_by: params.actor_id || 'system',
+        created_by_name: params.actor_name || 'System',
+        created_at: now,
         notes: 'Opening stock at creation',
       });
     }
-    this.logAudit(params.actor_id || 'system', params.actor_name || 'System',
-      'packaging_material_created', 'packaging_material', id, `Created ${mat.name}`);
+    this.logAudit(
+      params.actor_id || 'system',
+      params.actor_name || 'System',
+      'packaging_material_created',
+      'packaging_material',
+      id,
+      `Created ${mat.name}`
+    );
     return mat;
   }
 
-  public updatePackagingMaterial(id: string, params: Partial<PackagingMaterial>, actor_id?: string, actor_name?: string): PackagingMaterial | null {
+  public updatePackagingMaterial(
+    id: string,
+    params: Partial<PackagingMaterial>,
+    actor_id?: string,
+    actor_name?: string
+  ): PackagingMaterial | null {
     const mat = this.packagingMaterials.get(id);
     if (!mat) return null;
     const before = { ...mat };
-    if (params.name !== undefined) mat.name = params.name;
-    if (params.barcode !== undefined) mat.barcode = params.barcode;
-    if (params.sku !== undefined) mat.sku = params.sku;
+    const nextTrackScan = params.track_scan !== undefined ? Boolean(params.track_scan) : Boolean(mat.track_scan);
+    const nextBarcode = params.barcode !== undefined ? (params.barcode || '').trim() : (mat.barcode || '');
+
+    if (params.barcode !== undefined || params.track_scan !== undefined) {
+      this.validatePackagingBarcode(nextBarcode, nextTrackScan, id);
+    }
+
+    if (params.name !== undefined) mat.name = params.name.trim();
+    if (params.barcode !== undefined) mat.barcode = nextBarcode || undefined;
+    if (params.sku !== undefined) mat.sku = params.sku.trim();
     if (params.category !== undefined) mat.category = params.category;
     if (params.unit !== undefined) mat.unit = params.unit;
-    if (params.reorder_level !== undefined) mat.reorder_level = params.reorder_level;
-    if (params.unit_cost !== undefined) mat.unit_cost = params.unit_cost;
+    if (params.reorder_level !== undefined) mat.reorder_level = Number(params.reorder_level) || 0;
+    if (params.unit_cost !== undefined) mat.unit_cost = Number(params.unit_cost) || 0;
     if (params.notes !== undefined) mat.notes = params.notes;
+    if (params.active !== undefined) mat.active = Boolean(params.active);
+    if (params.track_scan !== undefined) mat.track_scan = Boolean(params.track_scan);
+    if (params.grams_per_piece !== undefined) mat.grams_per_piece = params.grams_per_piece;
+    if (params.conversion !== undefined) {
+      mat.conversion = params.conversion;
+      const calculated = this.calculatePackagingConversion(params.conversion);
+      if (calculated > 0) mat.grams_per_piece = calculated;
+    }
+
     mat.updated_at = new Date().toISOString();
-    this.logAudit(actor_id || 'system', actor_name || 'System',
-      'packaging_material_updated', 'packaging_material', id, `Updated ${mat.name}`,
-      JSON.stringify(before), JSON.stringify(mat));
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_material_updated',
+      'packaging_material',
+      id,
+      `Updated ${mat.name}`,
+      JSON.stringify(before),
+      JSON.stringify(mat)
+    );
     return mat;
   }
 
-  public receivePackagingStock(material_id: string, quantity: number, unit_cost: number,
-    reference_note?: string, actor_id?: string, actor_name?: string): PackagingMaterial | null {
+  public deletePackagingMaterial(id: string, actor_id?: string, actor_name?: string): boolean {
+    const mat = this.packagingMaterials.get(id);
+    if (!mat) return false;
+    mat.active = false;
+    mat.updated_at = new Date().toISOString();
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_material_archived',
+      'packaging_material',
+      id,
+      `Archived ${mat.name}`
+    );
+    return true;
+  }
+
+  public receivePackagingStock(
+    paramOrId: string | {
+      material_id: string;
+      quantity: number;
+      unit_cost: number;
+      payment_account_id?: string;
+      purchase_date?: string;
+      supplier_name?: string;
+      reference_note?: string;
+      actor_id?: string;
+      actor_name?: string;
+    },
+    legacyQty?: number,
+    legacyCost?: number,
+    legacyRef?: string,
+    legacyActorId?: string,
+    legacyActorName?: string
+  ): PackagingMaterial | null {
+    let material_id: string;
+    let quantity: number;
+    let unit_cost: number;
+    let payment_account_id: string | undefined;
+    let purchase_date: string | undefined;
+    let supplier_name: string | undefined;
+    let reference_note: string | undefined;
+    let actor_id: string | undefined;
+    let actor_name: string | undefined;
+
+    if (typeof paramOrId === 'object') {
+      material_id = paramOrId.material_id;
+      quantity = Number(paramOrId.quantity) || 0;
+      unit_cost = Number(paramOrId.unit_cost) || 0;
+      payment_account_id = paramOrId.payment_account_id;
+      purchase_date = paramOrId.purchase_date;
+      supplier_name = paramOrId.supplier_name;
+      reference_note = paramOrId.reference_note;
+      actor_id = paramOrId.actor_id;
+      actor_name = paramOrId.actor_name;
+    } else {
+      material_id = paramOrId;
+      quantity = Number(legacyQty) || 0;
+      unit_cost = Number(legacyCost) || 0;
+      reference_note = legacyRef;
+      actor_id = legacyActorId;
+      actor_name = legacyActorName;
+    }
+
     const mat = this.packagingMaterials.get(material_id);
-    if (!mat) return null;
+    if (!mat || quantity <= 0) return null;
+
     const now = new Date().toISOString();
+    const currentOnHand = Math.max(0, mat.on_hand);
+    const totalNewQty = currentOnHand + quantity;
+    if (totalNewQty > 0) {
+      mat.unit_cost = Number(((currentOnHand * mat.unit_cost + quantity * unit_cost) / totalNewQty).toFixed(2));
+    }
     mat.on_hand += quantity;
-    mat.available += quantity;
-    if (unit_cost > 0) mat.unit_cost = unit_cost;
+    mat.available = mat.on_hand - mat.reserved;
     mat.updated_at = now;
+
     this.packagingStockMovements.push({
       id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      material_id, material_name: mat.name, barcode: mat.barcode,
-      quantity_delta: quantity, reason: 'PURCHASE', unit_cost,
-      reference_note, created_by: actor_id || 'system',
-      created_by_name: actor_name || 'System', created_at: now,
+      material_id,
+      material_name: mat.name,
+      barcode: mat.barcode || '',
+      quantity_delta: quantity,
+      reason: 'PURCHASE',
+      unit_cost,
+      reference_note: reference_note || (supplier_name ? `Purchased from ${supplier_name}` : undefined),
+      created_by: actor_id || 'system',
+      created_by_name: actor_name || 'System',
+      created_at: now,
     });
-    this.logAudit(actor_id || 'system', actor_name || 'System',
-      'packaging_stock_received', 'packaging_material', material_id,
-      `Received ${quantity} ${mat.unit} of ${mat.name}`);
+
+    // Accounting: 1 expense via recordExpense
+    const totalAmount = Number((quantity * unit_cost).toFixed(2));
+    if (totalAmount > 0 && payment_account_id) {
+      this.recordExpense({
+        category_id: 'cat_packaging',
+        expense_account_id: 'acc_pack_exp',
+        payment_account_id,
+        amount: totalAmount,
+        date: purchase_date || now.split('T')[0],
+        description: `Packaging purchase${supplier_name ? ` - ${supplier_name}` : ''} (${mat.name} x ${quantity} ${mat.unit})`,
+        receipt_reference: reference_note || mat.sku,
+        actor_id: actor_id || 'system',
+        actor_name: actor_name || 'System',
+      });
+    }
+
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_stock_received',
+      'packaging_material',
+      material_id,
+      `Received ${quantity} ${mat.unit} of ${mat.name} at ৳${unit_cost}/${mat.unit} (Weighted Avg Cost: ৳${mat.unit_cost})`
+    );
     return mat;
   }
 
-  public usePackagingStock(material_id: string, quantity: number, order_id: string,
-    actor_id?: string, actor_name?: string): PackagingMaterial | null {
+  public usePackagingStock(
+    material_id: string,
+    quantity: number,
+    order_id: string,
+    actor_id?: string,
+    actor_name?: string
+  ): PackagingMaterial | null {
     const mat = this.packagingMaterials.get(material_id);
     if (!mat || mat.available < quantity) return null;
     const now = new Date().toISOString();
@@ -9445,13 +9789,313 @@ export class MirageDB {
     mat.updated_at = now;
     this.packagingStockMovements.push({
       id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      material_id, material_name: mat.name, barcode: mat.barcode,
-      quantity_delta: -quantity, reason: 'PACKAGING_USED', unit_cost: mat.unit_cost,
-      reference_id: order_id, reference_note: `Packed order ${order_id}`,
-      created_by: actor_id || 'system', created_by_name: actor_name || 'System',
+      material_id,
+      material_name: mat.name,
+      barcode: mat.barcode || '',
+      quantity_delta: -quantity,
+      reason: 'PACKAGING_USED',
+      unit_cost: mat.unit_cost,
+      reference_id: order_id,
+      reference_note: `Packed order ${order_id}`,
+      created_by: actor_id || 'system',
+      created_by_name: actor_name || 'System',
       created_at: now,
     });
     return mat;
+  }
+
+  public recordPackagingCount(params: {
+    counted_at?: string;
+    notes?: string;
+    items: { material_id: string; counted_quantity: number; notes?: string }[];
+    actor_id?: string;
+    actor_name?: string;
+  }): PackagingCount {
+    const id = `pkgcnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const now = new Date().toISOString();
+    const counted_at = params.counted_at || now;
+    const countItems: PackagingCountItem[] = [];
+
+    for (const item of params.items) {
+      const mat = this.packagingMaterials.get(item.material_id);
+      if (!mat) continue;
+      const system_quantity = mat.on_hand;
+      const counted_quantity = Math.max(0, Number(item.counted_quantity) || 0);
+      const diff = counted_quantity - system_quantity;
+      const total_cost_diff = Number((diff * mat.unit_cost).toFixed(2));
+
+      mat.on_hand = counted_quantity;
+      mat.available = mat.on_hand - mat.reserved;
+      mat.last_counted_at = counted_at;
+      mat.last_counted_by_name = params.actor_name || 'Staff';
+      mat.updated_at = now;
+
+      countItems.push({
+        material_id: mat.id,
+        material_name: mat.name,
+        barcode: mat.barcode,
+        system_quantity,
+        counted_quantity,
+        difference: diff,
+        unit_cost: mat.unit_cost,
+        total_cost_diff,
+        notes: item.notes,
+      });
+
+      if (diff !== 0) {
+        this.packagingStockMovements.push({
+          id: `pkgmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          material_id: mat.id,
+          material_name: mat.name,
+          barcode: mat.barcode || '',
+          quantity_delta: diff,
+          reason: 'COUNT_ADJUSTMENT',
+          unit_cost: mat.unit_cost,
+          reference_id: id,
+          reference_note: `Manual count adjustment (${diff > 0 ? '+' : ''}${diff})`,
+          created_by: params.actor_id || 'system',
+          created_by_name: params.actor_name || 'System',
+          created_at: now,
+        });
+      }
+    }
+
+    const countRecord: PackagingCount = {
+      id,
+      counted_at,
+      counted_by: params.actor_id || 'system',
+      counted_by_name: params.actor_name || 'Staff',
+      notes: params.notes,
+      items: countItems,
+      created_at: now,
+    };
+
+    this.packagingCounts.set(id, countRecord);
+    this.logAudit(
+      params.actor_id || 'system',
+      params.actor_name || 'System',
+      'packaging_count_recorded',
+      'packaging_count',
+      id,
+      `Recorded packaging physical count (${countItems.length} items checked)`
+    );
+    return countRecord;
+  }
+
+  public getPackagingCounts(): PackagingCount[] {
+    return Array.from(this.packagingCounts.values()).sort(
+      (a, b) => new Date(b.counted_at).getTime() - new Date(a.counted_at).getTime()
+    );
+  }
+
+  // Packaging Rules CRUD
+  public createPackagingRule(params: {
+    name: string;
+    min_pieces: number;
+    max_pieces?: number | null;
+    material_id: string;
+    quantity: number;
+    active?: boolean;
+    actor_id?: string;
+    actor_name?: string;
+  }): PackagingRule {
+    const id = `pkgrule_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const now = new Date().toISOString();
+    const rule: PackagingRule = {
+      id,
+      name: params.name.trim(),
+      min_pieces: Math.max(1, Number(params.min_pieces) || 1),
+      max_pieces: params.max_pieces !== undefined && params.max_pieces !== null ? Number(params.max_pieces) : null,
+      material_id: params.material_id,
+      quantity: Math.max(1, Number(params.quantity) || 1),
+      active: params.active !== undefined ? Boolean(params.active) : true,
+      created_at: now,
+      updated_at: now,
+    };
+    this.packagingRules.set(id, rule);
+    this.logAudit(
+      params.actor_id || 'system',
+      params.actor_name || 'System',
+      'packaging_rule_created',
+      'packaging_rule',
+      id,
+      `Created packaging rule "${rule.name}"`
+    );
+    return rule;
+  }
+
+  public updatePackagingRule(
+    id: string,
+    params: Partial<PackagingRule>,
+    actor_id?: string,
+    actor_name?: string
+  ): PackagingRule | null {
+    const rule = this.packagingRules.get(id);
+    if (!rule) return null;
+    if (params.name !== undefined) rule.name = params.name.trim();
+    if (params.min_pieces !== undefined) rule.min_pieces = Math.max(1, Number(params.min_pieces) || 1);
+    if (params.max_pieces !== undefined) rule.max_pieces = params.max_pieces !== null ? Number(params.max_pieces) : null;
+    if (params.material_id !== undefined) rule.material_id = params.material_id;
+    if (params.quantity !== undefined) rule.quantity = Math.max(1, Number(params.quantity) || 1);
+    if (params.active !== undefined) rule.active = Boolean(params.active);
+    rule.updated_at = new Date().toISOString();
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_rule_updated',
+      'packaging_rule',
+      id,
+      `Updated packaging rule "${rule.name}"`
+    );
+    return rule;
+  }
+
+  public deletePackagingRule(id: string, actor_id?: string, actor_name?: string): boolean {
+    const rule = this.packagingRules.get(id);
+    if (!rule) return false;
+    this.packagingRules.delete(id);
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_rule_deleted',
+      'packaging_rule',
+      id,
+      `Deleted packaging rule "${rule.name}"`
+    );
+    return true;
+  }
+
+  public getPackagingRules(): PackagingRule[] {
+    return Array.from(this.packagingRules.values());
+  }
+
+  // Packaging Settings
+  public getPackagingSettings(): PackagingSettings {
+    return this.packagingSettings;
+  }
+
+  public updatePackagingSettings(
+    params: Partial<PackagingSettings>,
+    actor_id?: string,
+    actor_name?: string
+  ): PackagingSettings {
+    if (params.cover_days !== undefined) {
+      this.packagingSettings.cover_days = Math.max(1, Number(params.cover_days) || 30);
+    }
+    this.logAudit(
+      actor_id || 'system',
+      actor_name || 'System',
+      'packaging_settings_updated',
+      'packaging_settings',
+      'settings',
+      `Updated packaging target cover days to ${this.packagingSettings.cover_days}`
+    );
+    return this.packagingSettings;
+  }
+
+  // Packaging Reports & Buy-List
+  public getPackagingUsageReport(params: { start_date?: string; end_date?: string }): PackagingUsageReportItem[] {
+    const startIso = params.start_date ? new Date(params.start_date).toISOString() : undefined;
+    const endIso = params.end_date ? new Date(params.end_date).toISOString() : undefined;
+
+    return Array.from(this.packagingMaterials.values()).map(mat => {
+      const allMovs = this.packagingStockMovements.filter(m => m.material_id === mat.id);
+
+      let opening_quantity = 0;
+      let received_quantity = 0;
+      let used_quantity = 0;
+      let adjusted_quantity = 0;
+
+      for (const m of allMovs) {
+        const mTime = new Date(m.created_at).toISOString();
+        if (startIso && mTime < startIso) {
+          opening_quantity += m.quantity_delta;
+        } else if (!endIso || mTime <= endIso) {
+          if (m.reason === 'PURCHASE' && m.quantity_delta > 0) {
+            received_quantity += m.quantity_delta;
+          } else if (
+            m.reason === 'PACKAGING_USED' ||
+            m.reason === 'PACKAGING_USED_SCAN' ||
+            m.reason === 'PACKAGING_USED_RULE'
+          ) {
+            used_quantity += Math.abs(m.quantity_delta);
+          } else if (m.reason !== 'OPENING_BALANCE') {
+            adjusted_quantity += m.quantity_delta;
+          } else {
+            // OPENING_BALANCE in range if no start_date
+            opening_quantity += m.quantity_delta;
+          }
+        }
+      }
+
+      const closing_quantity = opening_quantity + received_quantity - used_quantity + adjusted_quantity;
+      const total_used_cost = Number((used_quantity * mat.unit_cost).toFixed(2));
+
+      return {
+        material_id: mat.id,
+        material_name: mat.name,
+        sku: mat.sku,
+        category: mat.category,
+        unit: mat.unit,
+        opening_quantity,
+        received_quantity,
+        used_quantity,
+        adjusted_quantity,
+        closing_quantity,
+        unit_cost: mat.unit_cost,
+        total_used_cost,
+      };
+    });
+  }
+
+  public getPackagingBuyList(params?: { cover_days?: number }): PackagingBuyListItem[] {
+    const coverDays = Math.max(1, params?.cover_days || this.packagingSettings.cover_days || 30);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    return Array.from(this.packagingMaterials.values()).map(mat => {
+      const recentMovs = this.packagingStockMovements.filter(
+        m =>
+          m.material_id === mat.id &&
+          new Date(m.created_at).toISOString() >= thirtyDaysAgo &&
+          (m.reason === 'PACKAGING_USED' ||
+            m.reason === 'PACKAGING_USED_SCAN' ||
+            m.reason === 'PACKAGING_USED_RULE')
+      );
+
+      const recentUsed = recentMovs.reduce((sum, m) => sum + Math.abs(m.quantity_delta), 0);
+      const daily_usage_rate = Number((recentUsed / 30).toFixed(2));
+      const days_of_stock_left =
+        daily_usage_rate > 0
+          ? Number((mat.on_hand / daily_usage_rate).toFixed(1))
+          : mat.on_hand > 0
+          ? 999
+          : 0;
+
+      const targetQty = Math.ceil(daily_usage_rate * coverDays);
+      const recommended_reorder_qty = Math.max(
+        0,
+        targetQty > mat.on_hand ? targetQty - mat.on_hand : mat.on_hand <= mat.reorder_level ? mat.reorder_level * 2 - mat.on_hand : 0
+      );
+      const estimated_cost = Number((recommended_reorder_qty * mat.unit_cost).toFixed(2));
+      const status = this.getPackagingStockStatus(mat) as any;
+
+      return {
+        material_id: mat.id,
+        material_name: mat.name,
+        sku: mat.sku,
+        category: mat.category,
+        unit: mat.unit,
+        on_hand: mat.on_hand,
+        reorder_level: mat.reorder_level,
+        unit_cost: mat.unit_cost,
+        daily_usage_rate,
+        days_of_stock_left,
+        target_cover_days: coverDays,
+        recommended_reorder_qty,
+        estimated_cost,
+        status,
+      };
+    });
   }
 
   public getPackagingStockStatus(mat: PackagingMaterial): string {

@@ -1829,11 +1829,25 @@ export interface SystemHealthStatus {
 
 // --- Operations: Packaging Materials (Section 42 \u2014 separate from perfume Inventory) ---
 
-export type PackagingCategory = 'carton' | 'poly' | 'wrapping' | 'tape' | 'cutting_tool' | 'gift' | 'label' | 'other';
+export type PackagingCategory =
+  | 'carton'
+  | 'poly'
+  | 'wrapping'
+  | 'tape'
+  | 'cutting_tool'
+  | 'gift'
+  | 'label'
+  | 'paper'
+  | 'ink'
+  | 'stationery'
+  | 'other';
 
 export type PackagingStockMovementReason =
   | 'PURCHASE'
   | 'PACKAGING_USED'
+  | 'PACKAGING_USED_SCAN'
+  | 'PACKAGING_USED_RULE'
+  | 'COUNT_ADJUSTMENT'
   | 'DAMAGE'
   | 'LOSS'
   | 'TRANSFER'
@@ -1842,10 +1856,22 @@ export type PackagingStockMovementReason =
 
 export type PackagingStockStatus = 'healthy' | 'low_stock' | 'critical' | 'out_of_stock';
 
+export type PackagingPolymer = 'LDPE' | 'HDPE' | 'PP';
+
+export interface PackagingConversion {
+  method: 'dimensions' | 'sample';
+  width_cm?: number;
+  length_cm?: number;
+  thickness_micron?: number;
+  polymer?: PackagingPolymer;
+  sample_pieces?: number;
+  sample_grams?: number;
+}
+
 export interface PackagingMaterial {
   id: string;
   name: string;            // e.g. "Medium Carton", "Poly M"
-  barcode: string;         // e.g. "CTN-M", "POLY-M"
+  barcode?: string;        // optional when track_scan is false
   sku: string;             // internal code
   category: PackagingCategory;
   unit: string;            // e.g. "piece", "roll", "pack"
@@ -1853,12 +1879,87 @@ export interface PackagingMaterial {
   reserved: number;
   available: number;       // computed: on_hand - reserved
   reorder_level: number;   // warning threshold
-  unit_cost: number;       // last known cost in BDT
+  unit_cost: number;       // weighted average cost in BDT
   photo_url?: string;
   notes?: string;
   active: boolean;
+  track_scan?: boolean;    // true = scan deducts 1 at packing
+  grams_per_piece?: number;
+  conversion?: PackagingConversion;
+  last_counted_at?: string;
+  last_counted_by_name?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface PackagingRule {
+  id: string;
+  name: string;
+  min_pieces: number;
+  max_pieces: number | null;
+  material_id: string;
+  quantity: number;
+  active: boolean;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface PackagingSettings {
+  cover_days: number;
+}
+
+export interface PackagingCountItem {
+  material_id: string;
+  material_name: string;
+  barcode?: string;
+  system_quantity: number;
+  counted_quantity: number;
+  difference: number;
+  unit_cost: number;
+  total_cost_diff: number;
+  notes?: string;
+}
+
+export interface PackagingCount {
+  id: string;
+  counted_at: string;
+  counted_by: string;
+  counted_by_name: string;
+  notes?: string;
+  items: PackagingCountItem[];
+  created_at: string;
+}
+
+export interface PackagingUsageReportItem {
+  material_id: string;
+  material_name: string;
+  sku: string;
+  category: PackagingCategory;
+  unit: string;
+  opening_quantity: number;
+  received_quantity: number;
+  used_quantity: number;
+  adjusted_quantity: number;
+  closing_quantity: number;
+  unit_cost: number;
+  total_used_cost: number;
+}
+
+export interface PackagingBuyListItem {
+  material_id: string;
+  material_name: string;
+  sku: string;
+  category: PackagingCategory;
+  unit: string;
+  on_hand: number;
+  reorder_level: number;
+  unit_cost: number;
+  daily_usage_rate: number;
+  days_of_stock_left: number;
+  target_cover_days: number;
+  recommended_reorder_qty: number;
+  estimated_cost: number;
+  status: PackagingStockStatus;
 }
 
 export interface PackagingStockMovement {

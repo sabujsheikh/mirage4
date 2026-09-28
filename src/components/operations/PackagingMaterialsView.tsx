@@ -17,6 +17,9 @@ const CATEGORY_LABELS: Record<PackagingCategory, string> = {
   cutting_tool: 'Cutting Tool',
   gift: 'Gift',
   label: 'Label',
+  paper: 'Paper',
+  ink: 'Ink',
+  stationery: 'Stationery',
   other: 'Other',
 };
 
@@ -72,7 +75,7 @@ export const PackagingMaterialsView: React.FC = () => {
       }
       if (search) {
         const q = search.toLowerCase();
-        return m.name.toLowerCase().includes(q) || m.barcode.toLowerCase().includes(q) || m.sku.toLowerCase().includes(q);
+        return m.name.toLowerCase().includes(q) || (m.barcode && m.barcode.toLowerCase().includes(q)) || m.sku.toLowerCase().includes(q);
       }
       return true;
     });
